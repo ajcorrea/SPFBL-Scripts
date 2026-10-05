@@ -234,17 +234,40 @@ if [ "$HOST_BACKEND" = "nft_wrapper" ]; then
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 9. Limpar expressões xt compat SPFBL do /etc/sysconfig/nftables.conf
+# 9. Corrigir /etc/sysconfig/nftables.conf
 # ─────────────────────────────────────────────────────────────────────────────
-# Quando o script original rodava via iptables-nft, as expressões "xt match"
-# eram salvas no nftables.conf. O nftables.service não consegue recarregá-las
-# → serviço falha no restart. Removemos e fazemos backup.
-if [ "$HOST_BACKEND" = "nft_wrapper" ] && [ -f "$NFTABLES_CONF" ]; then
-    if grep -qE 'xt match "(recent|connlimit)"' "$NFTABLES_CONF" 2>/dev/null; then
-        cp "$NFTABLES_CONF" "${NFTABLES_CONF}.bak-$(date +%Y%m%d%H%M%S)"
-        sed -i '/xt match "recent"/d; /xt match "connlimit"/d' "$NFTABLES_CONF"
-        echo "[spfbl] Removidas expressões xt compat SPFBL de $NFTABLES_CONF (backup criado)" >&2
+# Dois problemas que causam falha no "nftables.service restart":
+#
+# A) "File exists": o arquivo usa comandos "add set/table/chain" mas o
+#    nftables.service NÃO faz flush automático antes de carregar o conf.
+#    Se qualquer set (SPFBL, CPGuard, etc.) já existe no kernel → erro.
+#    Solução: garantir que a primeira linha executável seja "flush ruleset",
+#    que limpa o kernel antes de recarregar tudo.
+#
+# B) "xt match recent/connlimit": expressões de compatibilidade geradas pelo
+#    iptables-nft quando o script original rodava. O nft nativo não consegue
+#    recarregá-las. Solução: remover as linhas problemáticas.
+if [ -f "$NFTABLES_CONF" ]; then
+    _CHANGED=0
+
+    # A) Garantir flush ruleset como primeira linha executável
+    if ! grep -qE '^\s*flush\s+ruleset' "$NFTABLES_CONF" 2>/dev/null; then
+        [ "$_CHANGED" -eq 0 ] && cp "$NFTABLES_CONF" "${NFTABLES_CONF}.bak-$(date +%Y%m%d%H%M%S)"
+        _CHANGED=1
+        sed -i '1s/^/flush ruleset\n/' "$NFTABLES_CONF"
+        echo "[spfbl] Adicionado 'flush ruleset' ao início de $NFTABLES_CONF" >&2
     fi
+
+    # B) Remover expressões xt compat SPFBL (apenas em sistemas nft_wrapper)
+    if [ "$HOST_BACKEND" = "nft_wrapper" ] && \
+       grep -qE 'xt match "(recent|connlimit)"' "$NFTABLES_CONF" 2>/dev/null; then
+        [ "$_CHANGED" -eq 0 ] && cp "$NFTABLES_CONF" "${NFTABLES_CONF}.bak-$(date +%Y%m%d%H%M%S)"
+        _CHANGED=1
+        sed -i '/xt match "recent"/d; /xt match "connlimit"/d' "$NFTABLES_CONF"
+        echo "[spfbl] Removidas expressões xt compat SPFBL de $NFTABLES_CONF" >&2
+    fi
+
+    [ "$_CHANGED" -eq 1 ] && echo "[spfbl] Backup salvo em ${NFTABLES_CONF}.bak-*" >&2
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────

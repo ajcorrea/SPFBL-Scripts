@@ -1,25 +1,38 @@
 #!/bin/bash
 #
 # spfbl-firewall-update — Atualizador de Firewall SPFBL (compatível com nftables)
-# Suporta: iptables legacy (AlmaLinux ≤9) e nf_tables puro (AlmaLinux 10+)
+# Suporta:
+#   - iptables-legacy  (AlmaLinux ≤9)
+#   - iptables-nft     (AlmaLinux 10 — wrapper que usa nf_tables internamente)
+#   - nftables puro    (AlmaLinux 10+ sem pacote iptables)
+#
+# A chain SPFBL é exclusivamente estática: vem do servidor matrix via netcat.
+# Não há daemon inserindo regras dinamicamente — a chain é simplesmente
+# recriada a cada execução do cron.
 #
 # Original: Leandro Carlos Rodrigues <leandro@spfbl.net>
 # Contribuição: Luciano Zanita <lucianozanita@advenhost.com.br>
 # Compatibilidade nftables: Alexandre Jeronimo Correa <alexandre@ontelecom.io / ajcorrea@gmail.com>
 #
 
-SPFBL_BIN="/usr/local/bin/spfbl-firewall"       # script final executado pelo cron/CSF
-SPFBL_IPT="/usr/local/bin/spfbl-firewall.ipt"   # cópia bruta do script iptables (modo legacy)
+SPFBL_BIN="/usr/local/bin/spfbl-firewall"
+SPFBL_IPT="/usr/local/bin/spfbl-firewall.ipt"
 CRON_LINK="/etc/cron.hourly/spfbl-firewall-update"
+NFTABLES_CONF="/etc/sysconfig/nftables.conf"
 TMPRAW=$(mktemp /tmp/spfbl-raw.XXXXXX)
 trap 'rm -f "$TMPRAW"' EXIT
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 1. Detectar backend de firewall no sistema
+# 1. Detectar backend (3 casos, resolvidos aqui no update, não no gerado)
 # ─────────────────────────────────────────────────────────────────────────────
-# Tentamos iptables -w -S. Se a tabela filter é incompatível (AlmaLinux 10 /
-# nf_tables puro), o comando falha → usamos nftables diretamente.
-if iptables -w -S >/dev/null 2>&1; then
+# legacy      : iptables-legacy — pode executar o .ipt diretamente
+# nft_wrapper : iptables-nft instalado — aceita comandos iptables mas traduz
+#               -m recent / -m connlimit para "xt match" no nftables, que NÃO
+#               pode ser recarregado pelo nftables.service → tratar como nft
+# nft         : sem iptables — nftables puro
+if iptables --version 2>/dev/null | grep -q 'nf_tables'; then
+    HOST_BACKEND="nft_wrapper"
+elif iptables -w -S >/dev/null 2>&1; then
     HOST_BACKEND="legacy"
 else
     HOST_BACKEND="nft"
@@ -35,12 +48,11 @@ if [ ! -s "$TMPRAW" ] || ! grep -q 'iptables' "$TMPRAW" 2>/dev/null; then
     exit 1
 fi
 
-# Guarda cópia bruta para o modo legacy
 cp "$TMPRAW" "$SPFBL_IPT"
 chmod +x "$SPFBL_IPT"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 3. Cron link (idêntico ao original)
+# 3. Cron link
 # ─────────────────────────────────────────────────────────────────────────────
 if [ ! -e "$CRON_LINK" ]; then
     ln -sf /usr/local/bin/spfbl-firewall-update "$CRON_LINK"
@@ -48,7 +60,7 @@ if [ ! -e "$CRON_LINK" ]; then
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 4. Integração CSF (idêntico ao original)
+# 4. Integração CSF
 # ─────────────────────────────────────────────────────────────────────────────
 if [ -d /etc/csf/ ]; then
     if [ -e /etc/csf/csfpost.sh ]; then
@@ -63,19 +75,15 @@ fi
 # ─────────────────────────────────────────────────────────────────────────────
 # 5. Parser: extrair valores do script baixado
 # ─────────────────────────────────────────────────────────────────────────────
-
-# Porta TCP (ex.: 25 para SMTP)
 PORT4=$(grep 'iptables.*INPUT.*--dport' "$TMPRAW" | \
         grep -oP -- '--dport \K\d+' | head -1)
 PORT4=${PORT4:-25}
 PORT6=$PORT4
 
-# Timeout dos sets de rastreamento (ex.: 600 segundos)
 TIMEOUT=$(grep 'iptables.*--seconds' "$TMPRAW" | \
           grep -oP -- '--seconds \K\d+' | head -1)
 TIMEOUT=${TIMEOUT:-600}
 
-# Connlimit IPv4
 CL4_ABOVE=$(grep -v ip6 "$TMPRAW" | grep -m1 'connlimit-above' | \
             grep -oP -- '--connlimit-above \K\d+')
 CL4_MASK=$(grep  -v ip6 "$TMPRAW" | grep -m1 'connlimit-mask' | \
@@ -83,7 +91,6 @@ CL4_MASK=$(grep  -v ip6 "$TMPRAW" | grep -m1 'connlimit-mask' | \
 CL4_ABOVE=${CL4_ABOVE:-8}
 CL4_MASK=${CL4_MASK:-24}
 
-# Connlimit IPv6
 CL6_ABOVE=$(grep -m1 'ip6tables.*connlimit-above' "$TMPRAW" | \
             grep -oP -- '--connlimit-above \K\d+')
 CL6_MASK=$(grep  -m1 'ip6tables.*connlimit-mask'  "$TMPRAW" | \
@@ -91,28 +98,22 @@ CL6_MASK=$(grep  -m1 'ip6tables.*connlimit-mask'  "$TMPRAW" | \
 CL6_ABOVE=${CL6_ABOVE:-8}
 CL6_MASK=${CL6_MASK:-48}
 
-# Array IPv4: "NOME_SET:MASCARA_PONTILHADA"
+# Arrays "NOME_SET:MASCARA" para IPv4 e IPv6
 mapfile -t IPV4_RECENT < <(
     grep 'iptables' "$TMPRAW" | grep -v ip6 | grep 'recent.*--rcheck' |
     sed -E 's/.*--name[[:space:]]+([^[:space:]]+)[[:space:]]+--mask[[:space:]]+([^[:space:]]+).*/\1:\2/'
 )
-
-# Array IPv6: "NOME_SET:MASCARA_HEX"
 mapfile -t IPV6_RECENT < <(
     grep 'ip6tables' "$TMPRAW" | grep 'recent.*--rcheck' |
     sed -E 's/.*--name[[:space:]]+([^[:space:]]+)[[:space:]]+--mask[[:space:]]+([^[:space:]]+).*/\1:\2/'
 )
 
-# Metadata do script original (para o cabeçalho do arquivo gerado)
 META_CLIENT=$(grep  '^# Client:'   "$TMPRAW" | head -1)
 META_CREATION=$(grep '^# Creation:' "$TMPRAW" | head -1)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 6. Helpers: converter prefixo CIDR → máscara (necessário para meter nft)
+# 6. Helpers: CIDR → máscara (necessário para meter nft — não aceita /24)
 # ─────────────────────────────────────────────────────────────────────────────
-# nftables NÃO aceita "ip saddr /24" dentro de meter — exige "ip saddr and 255.255.255.0"
-
-# Converte prefixo IPv4 (0-32) → máscara pontilhada  ex.: 24 → 255.255.255.0
 cidr4_to_mask() {
     local bits=$1 mask=0 i
     for ((i=0; i<bits; i++)); do mask=$(( mask | (1 << (31-i)) )); done
@@ -121,7 +122,6 @@ cidr4_to_mask() {
         $(( (mask>> 8)&255 )) $((  mask     &255 ))
 }
 
-# Converte prefixo IPv6 (0-128) → máscara hex  ex.: 48 → ffff:ffff:ffff:0:0:0:0:0
 cidr6_to_mask() {
     local bits=$1 i g b
     local -a grp=(0 0 0 0 0 0 0 0)
@@ -135,54 +135,38 @@ cidr6_to_mask() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 7. Funções auxiliares: gerar conteúdo do arquivo nft
+# 7. Funções emit_nft*: geram regras nftables nativas (sem xt compat)
+#    Sem SPFBL_BLOCKED — a chain é exclusivamente estática (não há daemon)
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Emite as linhas do arquivo .nft para criar tabela/chain/sets/regras IPv4
 emit_nft4_init() {
     echo "add table ip spfbl"
     echo "add chain ip spfbl SPFBL { type filter hook input priority 0; policy accept; }"
-    # Set para bloqueios dinâmicos do daemon (substituto dos -I SPFBL -s IP -j DROP)
-    echo "add set ip spfbl SPFBL_BLOCKED { type ipv4_addr; flags dynamic,timeout; timeout ${TIMEOUT}s; }"
-    # Um set por nível de prefixo (substituto do módulo recent com --mask)
     for e in "${IPV4_RECENT[@]}"; do
         local n="${e%%:*}"
         echo "add set ip spfbl ${n} { type ipv4_addr; flags dynamic,timeout; timeout ${TIMEOUT}s; }"
     done
-    # Regra connlimit: rejeita se há mais de N conexões do mesmo prefixo
-    # nftables exige máscara pontilhada com "and", não notação CIDR com "/"
     local _cl4m; _cl4m=$(cidr4_to_mask "$CL4_MASK")
     echo "add rule ip spfbl SPFBL tcp dport ${PORT4} meter spfbl4_cl size 65536 { ip saddr and ${_cl4m} ct count over ${CL4_ABOVE} } reject with tcp reset"
-    # Bloqueios diretos do daemon
-    echo "add rule ip spfbl SPFBL ip saddr @SPFBL_BLOCKED drop"
-    # Verificação por prefixo (equivalente ao --rcheck com --mask)
     for e in "${IPV4_RECENT[@]}"; do
         local n="${e%%:*}" m="${e#*:}"
         echo "add rule ip spfbl SPFBL tcp dport ${PORT4} ip saddr & ${m} @${n} drop"
     done
-    # Rastrear novas conexões: adiciona o IP (mascarado pelo prefixo) ao set
     for e in "${IPV4_RECENT[@]}"; do
         local n="${e%%:*}" m="${e#*:}"
         echo "add rule ip spfbl SPFBL tcp dport ${PORT4} ct state new update @${n} { ip saddr & ${m} timeout ${TIMEOUT}s }"
     done
 }
 
-# Emite linhas nft para atualizar (execuções subsequentes):
-# faz flush da chain (remove todas as regras, igual ao iptables -F SPFBL),
-# limpa os sets dinâmicos e re-adiciona as regras frescas do novo script.
 emit_nft4_refresh() {
-    # Equivalente ao iptables -F SPFBL: remove todas as regras da chain
+    # flush chain (equivale a iptables -F SPFBL) + flush sets + re-adiciona tudo
     echo "flush chain ip spfbl SPFBL"
-    # Limpa entradas dinâmicas dos sets (IPs rastreados)
-    echo "flush set ip spfbl SPFBL_BLOCKED"
     for e in "${IPV4_RECENT[@]}"; do
         local n="${e%%:*}"
         echo "flush set ip spfbl ${n}"
     done
-    # Re-adiciona regras frescas (tabela/chain/sets já existem)
     local _cl4m; _cl4m=$(cidr4_to_mask "$CL4_MASK")
     echo "add rule ip spfbl SPFBL tcp dport ${PORT4} meter spfbl4_cl size 65536 { ip saddr and ${_cl4m} ct count over ${CL4_ABOVE} } reject with tcp reset"
-    echo "add rule ip spfbl SPFBL ip saddr @SPFBL_BLOCKED drop"
     for e in "${IPV4_RECENT[@]}"; do
         local n="${e%%:*}" m="${e#*:}"
         echo "add rule ip spfbl SPFBL tcp dport ${PORT4} ip saddr & ${m} @${n} drop"
@@ -193,18 +177,15 @@ emit_nft4_refresh() {
     done
 }
 
-# Emite linhas nft para criar tabela/chain/sets/regras IPv6
 emit_nft6_init() {
     echo "add table ip6 spfbl"
     echo "add chain ip6 spfbl SPFBL { type filter hook input priority 0; policy accept; }"
-    echo "add set ip6 spfbl SPFBL_BLOCKED { type ipv6_addr; flags dynamic,timeout; timeout ${TIMEOUT}s; }"
     for e in "${IPV6_RECENT[@]}"; do
         local n="${e%%:*}"
         echo "add set ip6 spfbl ${n} { type ipv6_addr; flags dynamic,timeout; timeout ${TIMEOUT}s; }"
     done
     local _cl6m; _cl6m=$(cidr6_to_mask "$CL6_MASK")
     echo "add rule ip6 spfbl SPFBL tcp dport ${PORT6} meter spfbl6_cl size 65536 { ip6 saddr and ${_cl6m} ct count over ${CL6_ABOVE} } reject with tcp reset"
-    echo "add rule ip6 spfbl SPFBL ip6 saddr @SPFBL_BLOCKED drop"
     for e in "${IPV6_RECENT[@]}"; do
         local n="${e%%:*}" m="${e#*:}"
         echo "add rule ip6 spfbl SPFBL tcp dport ${PORT6} ip6 saddr & ${m} @${n} drop"
@@ -215,18 +196,14 @@ emit_nft6_init() {
     done
 }
 
-# Emite linhas nft para atualizar IPv6 (execuções subsequentes):
-# flush chain + flush sets + re-adiciona regras frescas.
 emit_nft6_refresh() {
     echo "flush chain ip6 spfbl SPFBL"
-    echo "flush set ip6 spfbl SPFBL_BLOCKED"
     for e in "${IPV6_RECENT[@]}"; do
         local n="${e%%:*}"
         echo "flush set ip6 spfbl ${n}"
     done
     local _cl6m; _cl6m=$(cidr6_to_mask "$CL6_MASK")
     echo "add rule ip6 spfbl SPFBL tcp dport ${PORT6} meter spfbl6_cl size 65536 { ip6 saddr and ${_cl6m} ct count over ${CL6_ABOVE} } reject with tcp reset"
-    echo "add rule ip6 spfbl SPFBL ip6 saddr @SPFBL_BLOCKED drop"
     for e in "${IPV6_RECENT[@]}"; do
         local n="${e%%:*}" m="${e#*:}"
         echo "add rule ip6 spfbl SPFBL tcp dport ${PORT6} ip6 saddr & ${m} @${n} drop"
@@ -238,15 +215,47 @@ emit_nft6_refresh() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 7. Gerar /usr/local/bin/spfbl-firewall (script dual-mode)
+# 8. nft_wrapper: remover chain iptables SPFBL antes de assumir com nft nativo
 # ─────────────────────────────────────────────────────────────────────────────
-# O arquivo gerado detecta o backend em tempo de execução e aplica as regras
-# adequadas: modo legacy chama o .ipt original; modo nft aplica via nft -f.
+# Execuções anteriores do script original criaram chain SPFBL via iptables-nft,
+# que ficou traduzida como "xt match recent/connlimit" no nftables.
+# Antes de aplicar as regras em nft nativo, removemos essa chain para evitar
+# dupla aplicação e para eliminar as expressões xt compat do kernel.
+if [ "$HOST_BACKEND" = "nft_wrapper" ]; then
+    for ipt in iptables ip6tables; do
+        if $ipt -w -L SPFBL -n >/dev/null 2>&1; then
+            # Remove todos os saltos INPUT → SPFBL (pode haver mais de um)
+            while $ipt -w -D INPUT -p tcp --dport "$PORT4" --syn \
+                        -m state --state NEW -j SPFBL 2>/dev/null; do :; done
+            $ipt -w -F SPFBL 2>/dev/null
+            $ipt -w -X SPFBL 2>/dev/null
+        fi
+    done
+fi
+
 # ─────────────────────────────────────────────────────────────────────────────
+# 9. Limpar expressões xt compat SPFBL do /etc/sysconfig/nftables.conf
+# ─────────────────────────────────────────────────────────────────────────────
+# Quando o script original rodava via iptables-nft, as expressões "xt match"
+# eram salvas no nftables.conf. O nftables.service não consegue recarregá-las
+# → serviço falha no restart. Removemos e fazemos backup.
+if [ "$HOST_BACKEND" = "nft_wrapper" ] && [ -f "$NFTABLES_CONF" ]; then
+    if grep -qE 'xt match "(recent|connlimit)"' "$NFTABLES_CONF" 2>/dev/null; then
+        cp "$NFTABLES_CONF" "${NFTABLES_CONF}.bak-$(date +%Y%m%d%H%M%S)"
+        sed -i '/xt match "recent"/d; /xt match "connlimit"/d' "$NFTABLES_CONF"
+        echo "[spfbl] Removidas expressões xt compat SPFBL de $NFTABLES_CONF (backup criado)" >&2
+    fi
+fi
 
-{   # — início do bloco gerador —
+# ─────────────────────────────────────────────────────────────────────────────
+# 10. Gerar /usr/local/bin/spfbl-firewall (script dual-mode: legacy | nft)
+# ─────────────────────────────────────────────────────────────────────────────
+# O script gerado detecta o backend em tempo de execução:
+#   legacy → executa spfbl-firewall.ipt (iptables puro, sem xt compat)
+#   nft    → aplica via nft nativo (cobre tanto nft puro quanto nft_wrapper)
+# ─────────────────────────────────────────────────────────────────────────────
+{
 
-# Cabeçalho
 printf '%s\n' '#!/bin/bash'
 printf '%s\n' '#'
 printf '%s\n' '# Firewall for SPFBL client — nftables compatible.'
@@ -257,12 +266,12 @@ printf '%s\n' "# Geração: $(date -R)"
 printf '%s\n' '#'
 printf '\n'
 
-# Detecção de backend (executada em tempo de execução do firewall)
 cat <<'DETECT_BLOCK'
 # ── Detecção de backend ───────────────────────────────────────────────────────
-# Se iptables consegue listar as regras → modo legacy (iptables-nft ou legacy).
-# Caso contrário (tabela filter incompatível, AlmaLinux 10) → modo nftables puro.
-if iptables -w -S >/dev/null 2>&1; then
+# legacy : iptables-legacy verdadeiro → executa .ipt diretamente
+# nft    : iptables-nft (wrapper) OU sem iptables → nft nativo completo
+if ! iptables --version 2>/dev/null | grep -q 'nf_tables' && \
+     iptables -w -S >/dev/null 2>&1; then
     _BACKEND="legacy"
 else
     _BACKEND="nft"
@@ -270,36 +279,28 @@ fi
 
 DETECT_BLOCK
 
-# ── Modo Legacy ───────────────────────────────────────────────────────────────
-cat <<'LEGACY_START'
-# ─── Modo Legacy (iptables) ───────────────────────────────────────────────────
+cat <<'LEGACY_BLOCK'
 if [ "$_BACKEND" = "legacy" ]; then
     bash /usr/local/bin/spfbl-firewall.ipt
 
-LEGACY_START
+LEGACY_BLOCK
 
-# ── Modo NFT ──────────────────────────────────────────────────────────────────
-cat <<'NFT_ELSE'
+cat <<'NFT_BLOCK'
 else
-# ─── Modo nftables ────────────────────────────────────────────────────────────
     NFT=$(command -v nft 2>/dev/null || echo /usr/sbin/nft)
     NFTSCRIPT=$(mktemp /tmp/spfbl-nft.XXXXXX.nft)
     trap 'rm -f "$NFTSCRIPT"' EXIT
 
-NFT_ELSE
+NFT_BLOCK
 
-# -- IPv4: bloco de criação (primeira execução) --
+# -- IPv4 --
 printf '%s\n' '    # ── IPv4 ──────────────────────────────────────────────────────────────────'
 printf '%s\n' '    if ! $NFT list table ip spfbl >/dev/null 2>&1; then'
-printf '%s\n' '        # Primeira execução: cria tabela, chain, sets e regras'
 printf '%s\n' "        cat > \"\$NFTSCRIPT\" <<'__NFT4I__'"
 emit_nft4_init
 printf '%s\n' '__NFT4I__'
 printf '%s\n' '        $NFT -f "$NFTSCRIPT"'
-
-# -- IPv4: bloco de flush (execuções subsequentes) --
 printf '%s\n' '    else'
-printf '%s\n' '        # Já existe: flush chain + flush sets + re-adiciona regras (igual ao iptables -F SPFBL)'
 printf '%s\n' "        cat > \"\$NFTSCRIPT\" <<'__NFT4R__'"
 emit_nft4_refresh
 printf '%s\n' '__NFT4R__'
@@ -307,16 +308,13 @@ printf '%s\n' '        $NFT -f "$NFTSCRIPT"'
 printf '%s\n' '    fi'
 printf '\n'
 
-# -- IPv6: bloco de criação --
+# -- IPv6 --
 printf '%s\n' '    # ── IPv6 ──────────────────────────────────────────────────────────────────'
 printf '%s\n' '    if ! $NFT list table ip6 spfbl >/dev/null 2>&1; then'
-printf '%s\n' '        # Primeira execução IPv6'
 printf '%s\n' "        cat > \"\$NFTSCRIPT\" <<'__NFT6I__'"
 emit_nft6_init
 printf '%s\n' '__NFT6I__'
 printf '%s\n' '        $NFT -f "$NFTSCRIPT"'
-
-# -- IPv6: bloco de flush --
 printf '%s\n' '    else'
 printf '%s\n' "        cat > \"\$NFTSCRIPT\" <<'__NFT6R__'"
 emit_nft6_refresh
@@ -325,14 +323,13 @@ printf '%s\n' '        $NFT -f "$NFTSCRIPT"'
 printf '%s\n' '    fi'
 printf '\n'
 
-# Fecha o bloco else do backend
 printf '%s\n' 'fi  # end _BACKEND'
 
-} > "$SPFBL_BIN"   # — fim do bloco gerador —
+} > "$SPFBL_BIN"
 
 chmod +x "$SPFBL_BIN"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 8. Executar o firewall gerado (erros vão para stderr → aparecem no log do cron)
+# 11. Executar o firewall gerado (erros aparecem no log do cron)
 # ─────────────────────────────────────────────────────────────────────────────
 "$SPFBL_BIN"
